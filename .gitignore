@@ -1,4 +1,4 @@
-.Rproj
-.nb.html
+*.Rproj
+*.nb.html
 .Rproj.user
-*.ipynb
+*.ipynb_checkpoints
