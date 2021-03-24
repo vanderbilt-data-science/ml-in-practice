@@ -1,0 +1,255 @@
+---
+title: "tidymodels-ml-workflows"
+output: html_notebook
+---
+
+In this notebook, we demonstrate the usage of pipelines to promote best practices in ML in python.  We'll make sure that all of our pre-processing steps are included within the cross validation training loop, measure performance using cross validation, and make sure to use literate programming practices to share our work.
+
+# Technical objective
+Our technical objective here is to predict the sex of a penguin given its other distinguishing features.
+
+### Useful packages
+```{r import packages, results='hide'}
+if (!require("pacman"))
+   install.packages("pacman")
+
+pacman::p_load(palmerpenguins, tidyverse, tidymodels, usemodels, glmnet, tictoc, vip, tidytext, skimr, doParallel)
+
+registerDoParallel()
+```
+# Load the data
+In this example, we'll use Allison Horst's penguins dataset.  This is present in the `palmerpenguins` package that we loaded.  Read more about the package and data in the [GitHub repo](https://github.com/allisonhorst/palmerpenguins) or on the introduction page [here.](https://allisonhorst.github.io/palmerpenguins/articles/intro.html)
+
+```{r load data and learn a bit}
+peng_data <- penguins
+peng_data
+
+peng_data %>% skim
+```
+# Data cleaning and EDA
+
+We can now explore our data.  We leave this exercise to the reader.  For now, we can observe that there are a few NA values which will likely need imputation.  We'll wait for this step so that we can put it within our training loop.  For now, we'll just drop all of the sex NAs out of the dataframe.
+```{r eda chunk}
+peng_data <- peng_data %>%
+  drop_na(sex)
+
+nrow(peng_data)
+n_missing(peng_data)
+
+levels(peng_data$sex)
+```
+
+# Split the data
+Here, we employ the initial split to separate the training from the golden holdout test set.
+```{r data split}
+set.seed(2435)
+
+data_split <- initial_split(peng_data, prop=3/4, strata=sex)
+
+train_data <- training(data_split)
+test_data <- testing(data_split)
+```
+
+```{r data split sanity check}
+train_data
+
+test_data
+```
+# Establish training workflow
+
+# Feature engineering recipe
+It looks like we first might need to do some imputation on some values within our rows.  Then, it looks like we have some categorical columns so those will need to be encoded.  However, this isn't all the columns since our column types are heterogeneous.  Let's see what transforming specific columns looks like here.
+
+Note that in the end, this will be methodology-specific.  For example, if you're using ONLY tree-based methods, these can generally handle missing values without imputation.  Although we use logistic regression below, we also perform imputation to demonstrate the method.
+
+One awesome way to generate a recipe is through the `usemodels` package.  You can learn more about it through the reference pages.  After we use the appropriate command specific to our model (here, glmnet), the package generates 
+
+```{r generate glmnet specs using usemodels}
+use_glmnet(sex ~ ., data=train_data)
+```
+```{r feature engineering recipe}
+glmnet_recipe <- 
+  recipe(formula = sex ~ ., data = train_data) %>% 
+  step_novel(all_nominal(), -all_outcomes()) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors(), -all_nominal()) 
+```
+
+# Full workflow
+Here, we'll specify the parameters of the complete workflow - including the recipe for feature engineering along with the model and the parameters to be tuned.  Note that again, we grabbed a bunch of this from the output of usemodels.  The grid strategy was changed to a sampling strategy from dials.  Check out this package for more hyperparameter combination strategies.
+```{r specify full workflow}
+glmnet_spec <- 
+  logistic_reg(penalty = tune(), mixture = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("glmnet") 
+
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(glmnet_recipe) %>% 
+  add_model(glmnet_spec) 
+```
+
+# Cross-validation
+We'll use k-fold cross validation as our resampling strategy.
+```{r fold generation}
+cv_folds <- vfold_cv(train_data, v=5, strata=sex)
+cv_folds$splits
+```
+
+Now, we'll specify our tuning grid and perform cross-validated hyperparameter tuning.  The grid strategy was changed to a sampling strategy from dials rather than the template from usemodels.  Check out this package for more hyperparameter combination strategies.
+```{r tuning with xval}
+glmnet_parameters <- parameters(glmnet_spec)
+glmnet_grid <- grid_max_entropy(glmnet_parameters, size=5)
+```
+
+```{r perform hyperparameter tuning via xvalidation, results='hide'}
+tic()
+glmnet_tune <- glmnet_workflow %>%
+  tune_grid(resamples = cv_folds,
+            grid = glmnet_grid,
+            metrics = metric_set(accuracy, roc_auc, pr_auc, sens, yardstick::spec, ppv, npv, f_meas),
+            control = control_grid(verbose = TRUE))
+toc()
+```
+
+
+## Cross-validation metric distributions
+In this section, we're going to take a little bit of a look at the individualized performance of the models taking into each fold into account.  This will satisfy our academic curiosity in terms of machine learning and also provide some insight into the behaviors of the models.  We'll look more at the aggregated measures in a moment.
+
+We'll first decompress the tuning metrics a bit to get them into a more friendly form for processing.  
+```{r arrange cross validation metrics}
+#extract the cross validation metrics for the glmnet by fold (i.e., unsummarized)
+glmnet_fold_metrics <- glmnet_tune %>%
+  select(id, .metrics, .notes) %>%
+  unnest(.metrics)
+
+head(glmnet_fold_metrics, 10)
+```
+There's obviously a tremendous amount of visualization that can be done here with this cross validation information.
+
+# Identifying the "best" model
+Now, let's collect the metrics to see how the model did over all of the folds and all of the metrics in order to identify the best model from these candidates.  Note that this tabe looks similar to the prior tibble; the main difference here is that the results are aggregated over the folds (hence the `mean` and `n` columns).
+
+```{r aggregating hyperparameter tuning/cross validation metrics}
+tune_metrics <- glmnet_tune %>% 
+  collect_metrics()
+
+head(tune_metrics, 5)
+```
+
+
+## Selecting the best model
+With this information in mind as well as more help from tidymodels, we can then select the "best" model.  One way to do this is to simply choose according to some metric.  We'll decide to use `roc_auc` here just because our training data is so imbalanced.
+
+```{r get best hyperparameters from resampling}
+eval_metric <- 'roc_auc'
+
+#show best parameters in terms of roc_auc
+glmnet_tune %>% show_best(eval_metric)
+```
+
+```{r select best parameters}
+#select best parameters
+best_glmnet_params <- glmnet_tune %>%
+  select_best(eval_metric)
+
+#show selected parameters
+best_glmnet_params
+```
+
+
+# Training fit
+Having identified the best hyperparameters, we can create the final fit on all of the training data:
+
+```{r fit workflow on training data}
+#finalize workflow with model hyperparameters
+glmnet_final_wf <- glmnet_workflow %>%
+  finalize_workflow(best_glmnet_params)
+glmnet_final_wf
+
+#using final workflow, fit on training data
+glmnet_final_fit <- glmnet_final_wf %>%
+  fit(data = train_data)
+```
+
+# Selected Model Performance Evaluation
+## Cross validation metrics from best model
+Let's first evaluate the performance using the cross-validation metrics from before.  However, here, we'll only look at the best model.
+```{r best model cross validation}
+#get best glmnet metrics
+best_glmnet_fold_metrics <- glmnet_fold_metrics %>%
+  filter(.config==best_glmnet_params$.config[[1]])
+
+#plot
+best_glmnet_fold_metrics %>%
+  mutate(facet_val = if_else(.metric== 'roc_auc' | .metric=='pr_auc' | .metric=='f_meas', 'Aggregate metrics', 'Confusion matrix metrics')) %>%
+  ggplot(aes(x=.metric, y=.estimate, fill=.metric)) +
+  geom_boxplot(outlier.shape = NA, na.rm=TRUE) +
+  geom_jitter(aes(x=.metric, y=.estimate), na.rm=TRUE) +
+  facet_grid(cols=vars(facet_val), scales='free') + #just to get on separate plots
+  labs(title='Distribution of cross validation metrics for best hyperparameter set',
+       subtitle='By metric',
+       x='metric',
+       y='metric estimate') +
+  theme(legend.position = "none")
+```
+Here we can see the overall performance of the best model during its cross validation phase.  We leave commentary on the performance to the reader.
+
+## Performance on training data as a whole
+Here, we look at the confusion matrix for the entire training set as well as computations from the confusion matrix.
+```{r extract and visualize training performance}
+#get prediction class and probabilities
+hp_training_preds <- 
+  predict(glmnet_final_fit, train_data) %>%
+  bind_cols(predict(glmnet_final_fit, train_data, type = "prob")) %>% 
+  bind_cols(train_data %>% 
+              select(sex))
+
+#calculate confusion matrix
+train_conf <- hp_training_preds %>%
+  conf_mat(sex, .pred_class) 
+
+#get summary info
+t1 <- train_conf %>%
+  summary() %>%
+  select(-.estimator) %>%
+  gridExtra::tableGrob(rows=NULL, theme=gridExtra::ttheme_default(base_size=10))
+
+#plot cmat info
+cm <- train_conf %>%
+  autoplot(type='heatmap') +
+  labs(title='Confusion matrix for training data')
+
+gridExtra::grid.arrange(cm, t1, ncol=2)
+```
+These results allow us several important insights:
+1. The confusion matrix reflects the distribution of the data
+2. The calculated metrics correctly reflect the target class formulation
+3. The performance leaves room for improvement in terms of metrics calculated based on a threshold
+
+# Explaining the model
+## Variable imporance
+What parameters are contributing most strongly to the classification?  Do we see evidence of data snooping?  Let's take a look!
+
+```{r glmnet variable importance, fig.height=6}
+glmnet_vip <- glmnet_final_fit %>%
+  pull_workflow_fit() %>%
+  vi_model(lambda = .$spec$args$penalty) %>%
+  mutate(scaled_imp = Importance/sum(Importance)) %>%
+  mutate(association = if_else(Sign=='NEG', 'female', 'male'))
+
+glmnet_vip %>%
+  ggplot(aes(x=fct_reorder(Variable, scaled_imp), y=scaled_imp, fill=association))+
+  geom_col() +
+  coord_flip() +
+  labs(title='Scaled coefficient magnitudes of glmnet',
+       subtitle=str_c('Penalty:', format(pull_workflow_fit(glmnet_final_fit)$spec$args$penalty,
+                                         digits=5, nsmall=2, scientific=TRUE),
+                      'Mixture:', format(pull_workflow_fit(glmnet_final_fit)$spec$args$mixture[[2]],
+                                         digits=5, nsmall=3),
+                      sep=' '),
+       y='scaled absolute importance',
+       x='variable')
+```
+Question: how do I know the "order" or the "target" class?  E.g., sensitivity is calculated by the number of true positives over the total number of positives.  Which of these factors is positive?
