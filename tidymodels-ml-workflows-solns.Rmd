@@ -1,5 +1,5 @@
 ---
-title: "tidymodels-ml-workflows"
+title: "tidymodels-ml-workflows-solns"
 output: html_notebook
 ---
 
@@ -53,7 +53,9 @@ test_data <- testing(data_split)
 ```
 
 ```{r data split sanity check}
+train_data
 
+test_data
 ```
 # Establish training workflow
 
@@ -77,9 +79,9 @@ glmnet_recipe <-
   step_zv(all_predictors()) %>% 
   step_normalize(all_numeric_predictors()) 
 
-#look at recpe
+glmnet_recipe
 
-#get summary
+summary(glmnet_recipe)
 ```
 # Model specification
 ```{r specify model}
@@ -95,11 +97,11 @@ glmnet_spec <-
 Here, we'll specify the parameters of the complete workflow - including the recipe for feature engineering along with the model and the parameters to be tuned.  Note that again, we grabbed a bunch of this from the output of usemodels.  The grid strategy was changed to a sampling strategy from dials.  Check out this package for more hyperparameter combination strategies.
 ```{r specify full workflow}
 glmnet_workflow <- 
-  workflow() %>%
-  # add recipe
-  # add model specification
+  workflow() %>% 
+  add_recipe(glmnet_recipe) %>% 
+  add_model(glmnet_spec) 
 
-
+glmnet_workflow
 ```
 
 # Cross-validation
@@ -115,23 +117,18 @@ tidy(cv_folds$splits[[1]])
 # Training using resamples
 
 ```{r train with resamples}
-
-#fit the resamples
 cv_results <- glmnet_workflow %>%
   fit_resamples(cv_folds)
 
-#view results
+cv_results
 
-#simplify results for viewing
 cv_results %>%
   select(id, .metrics, .notes) %>%
   unnest(.metrics)
 
-#aggregate the metrics
 cv_metrics <- cv_results %>%
   collect_metrics()
 
-#view metrics
 cv_metrics
 
 ```
